@@ -8,4 +8,5 @@ resources:
 - deploy/podsecuritypolicy.yaml
 - deploy/update-agent-sa.yaml
 - deploy/update-agent.yaml
+- deploy/update-operator-sa.yaml
 - deploy/update-operator.yaml
