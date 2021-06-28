@@ -21,7 +21,7 @@ import (
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/apimachinery/pkg/watch"
-	"k8s.io/client-go/kubernetes"
+	appsv1client "k8s.io/client-go/kubernetes/typed/apps/v1"
 	corev1client "k8s.io/client-go/kubernetes/typed/core/v1"
 	watchtools "k8s.io/client-go/tools/watch"
 	"k8s.io/klog/v2"
@@ -31,11 +31,18 @@ import (
 	"github.com/kinvolk/flatcar-linux-update-operator/pkg/updateengine"
 )
 
+// Config represents configurable options for agent.
+type Config struct {
+	NodeName               string
+	PodDeletionGracePeriod time.Duration
+}
+
 // Klocksmith implements agent part of FLUO.
 type Klocksmith struct {
 	node        string
-	kc          kubernetes.Interface
+	pg          corev1client.PodsGetter
 	nc          corev1client.NodeInterface
+	dsg         appsv1client.DaemonSetsGetter
 	ue          *updateengine.Client
 	lc          *login1.Conn
 	reapTimeout time.Duration
@@ -56,15 +63,12 @@ var shouldRebootSelector = fields.Set(map[string]string{
 }).AsSelector()
 
 // New returns initialized Klocksmith.
-func New(node string, reapTimeout time.Duration) (*Klocksmith, error) {
+func New(config *Config) (*Klocksmith, error) {
 	// Set up kubernetes in-cluster client.
 	kc, err := k8sutil.GetClient("")
 	if err != nil {
 		return nil, fmt.Errorf("creating Kubernetes client: %w", err)
 	}
-
-	// Node interface.
-	nc := kc.CoreV1().Nodes()
 
 	// Set up update_engine client.
 	ue, err := updateengine.New()
@@ -79,12 +83,13 @@ func New(node string, reapTimeout time.Duration) (*Klocksmith, error) {
 	}
 
 	return &Klocksmith{
-		node:        node,
-		kc:          kc,
-		nc:          nc,
+		node:        config.NodeName,
+		pg:          kc.CoreV1(),
+		dsg:         kc.AppsV1(),
+		nc:          kc.CoreV1().Nodes(),
 		ue:          ue,
 		lc:          lc,
-		reapTimeout: reapTimeout,
+		reapTimeout: config.PodDeletionGracePeriod,
 	}, nil
 }
 
@@ -239,7 +244,7 @@ func (k *Klocksmith) process(stop <-chan struct{}) error {
 	for _, pod := range pods {
 		klog.Infof("Terminating pod %q...", pod.Name)
 
-		if err := k.kc.CoreV1().Pods(pod.Namespace).Delete(context.TODO(), pod.Name, metav1.DeleteOptions{}); err != nil {
+		if err := k.pg.Pods(pod.Namespace).Delete(context.TODO(), pod.Name, metav1.DeleteOptions{}); err != nil {
 			// Continue anyways, the reboot should terminate it.
 			klog.Errorf("failed terminating pod %q: %v", pod.Name, err)
 		}
@@ -450,7 +455,7 @@ func (k *Klocksmith) waitForNotOkToReboot() error {
 }
 
 func (k *Klocksmith) getPodsForDeletion() ([]corev1.Pod, error) {
-	pods, err := k8sutil.GetPodsForDeletion(context.TODO(), k.kc, k.node)
+	pods, err := k8sutil.GetPodsForDeletion(context.TODO(), k.pg, k.dsg, k.node)
 	if err != nil {
 		return nil, fmt.Errorf("getting list of pods for deletion: %w", err)
 	}
@@ -469,7 +474,7 @@ func (k *Klocksmith) getPodsForDeletion() ([]corev1.Pod, error) {
 // waitForPodDeletion waits for a pod to be deleted.
 func (k *Klocksmith) waitForPodDeletion(pod corev1.Pod) error {
 	return wait.PollImmediate(defaultPollInterval, k.reapTimeout, func() (bool, error) {
-		p, err := k.kc.CoreV1().Pods(pod.Namespace).Get(context.TODO(), pod.Name, metav1.GetOptions{})
+		p, err := k.pg.Pods(pod.Namespace).Get(context.TODO(), pod.Name, metav1.GetOptions{})
 		if errors.IsNotFound(err) || (p != nil && p.ObjectMeta.UID != pod.ObjectMeta.UID) {
 			klog.Infof("Deleted pod %q", pod.Name)
 
